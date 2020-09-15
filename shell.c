@@ -39,6 +39,17 @@ struct pipecmd {
   struct cmd *right; // right side of pipe
 };
 
+struct listcmd {
+  int type;
+  struct cmd *left;
+  struct cmd *right;
+};
+
+struct backcmd {
+  int type;
+  struct cmd *back;
+};
+
 int fork1(void);  // Fork but exits on failure.
 struct cmd *parsecmd(char*);
 
@@ -54,6 +65,8 @@ runcmd(struct cmd *cmd)
   struct execcmd *ecmd;
   struct pipecmd *pcmd;
   struct redircmd *rcmd;
+  struct listcmd *lcmd;
+  struct backcmd *bcmd;
 
   if(cmd == 0)
     _exit(0);
@@ -71,8 +84,6 @@ runcmd(struct cmd *cmd)
     iter = PATH;
     success = 0;
     for (i = 0; i < path_count; i++) {
-      path_len = strlen(iter[i]);
-      cmd_len = strlen(argv[0]);
       strcpy(cmds, iter[i]);
       path = strcat(cmds, argv[0]);
       success |= (access(path, X_OK) != -1);
@@ -90,20 +101,11 @@ runcmd(struct cmd *cmd)
   case '<':
     rcmd = (struct redircmd*)cmd;
     // Your code here ...
-    if (cmd->type == '>') {
-      close(1);
-      if (open(rcmd->file, rcmd->flags) == -1) {
-        fprintf(stderr, "cannot open the file %s\n", rcmd->file);
-      }
-    }
-    else {
-      close(0);
-      if (open(rcmd->file, rcmd->flags) == -1) {
-        fprintf(stderr, "cannot open the file %s\n", rcmd->file);
-      }
+    close(rcmd->fd);
+    if (open(rcmd->file, rcmd->flags) == -1) {
+      fprintf(stderr, "cannot open the file %s\n", rcmd->file);
     }
     runcmd(rcmd->cmd);
-    close(rcmd->fd);
     break;
 
   case '|':
@@ -132,6 +134,14 @@ runcmd(struct cmd *cmd)
     wait(NULL);
     wait(NULL);
     break;
+  
+  case ';':
+    lcmd = (struct listcmd*)cmd;
+    if (fork1() == 0) 
+      runcmd(lcmd->left);
+    wait(NULL);
+    runcmd(lcmd->right);
+    break;
   }    
   _exit(0);
 }
@@ -152,6 +162,7 @@ main(void)
 {
   static char buf[100];
   int fd, r;
+  struct cmd *cmd;
 
   // Read and run input commands.
   while(getcmd(buf, sizeof(buf)) >= 0){
@@ -163,9 +174,19 @@ main(void)
         fprintf(stderr, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(&r);
+    cmd = parsecmd(buf);
+    if (cmd->type == '&') {
+      if(fork1() == 0) {
+        struct backcmd *bcmd = (struct backcmd*)cmd;
+        fprintf(stdout, "%d\n", getpid());
+        runcmd(bcmd->back);
+      }
+    }
+    else {
+      if(fork1() == 0) 
+        runcmd(cmd);
+      wait(&r);
+    }
   }
   exit(0);
 }
@@ -220,10 +241,33 @@ pipecmd(struct cmd *left, struct cmd *right)
   return (struct cmd*)cmd;
 }
 
+struct cmd*
+listcmd(struct cmd *left, struct cmd *right) 
+{
+  struct listcmd *cmd;
+  cmd = malloc(sizeof(*cmd));
+  memset(cmd, 0, sizeof(*cmd));
+  cmd->type = ';';
+  cmd->left = left;
+  cmd->right = right;
+  return (struct cmd*)cmd;
+}
+
+struct cmd*
+backcmd(struct cmd *subcmd) 
+{
+  struct backcmd *cmd;
+  cmd = malloc(sizeof(*cmd));
+  memset(cmd, 0, sizeof(*cmd));
+  cmd->type = '&';
+  cmd->back = subcmd;
+  return (struct cmd*)cmd;
+}
+
 // Parsing
 
 char whitespace[] = " \t\r\n\v";
-char symbols[] = "<|>";
+char symbols[] = "<|>;&()";
 
 int
 gettoken(char **ps, char *es, char **q, char **eq)
@@ -244,7 +288,15 @@ gettoken(char **ps, char *es, char **q, char **eq)
   case '<':
     s++;
     break;
+  case '(':
+  case ')':
   case '>':
+    s++;
+    break;
+  case ';':
+    s++;
+    break;
+  case '&':
     s++;
     break;
   default:
@@ -313,6 +365,21 @@ parseline(char **ps, char *es)
 {
   struct cmd *cmd;
   cmd = parsepipe(ps, es);
+  if (peek(ps, es, "(")) {
+    gettoken(ps, es, 0, 0);
+    cmd = parseline(ps, es);
+    if (peek(ps, es, ")")) {
+      gettoken(ps, es, 0, 0);
+    }
+  }
+  if (peek(ps, es, "&")) {
+    gettoken(ps, es, 0, 0);
+    cmd = backcmd(cmd);
+  }
+  if (peek(ps, es, ";")) {
+    gettoken(ps, es, 0, 0);
+    cmd = listcmd(cmd, parseline(ps, es));
+  }
   return cmd;
 }
 
@@ -366,7 +433,7 @@ parseexec(char **ps, char *es)
 
   argc = 0;
   ret = parseredirs(ret, ps, es);
-  while(!peek(ps, es, "|")){
+  while(!peek(ps, es, "|;&()")){
     if((tok=gettoken(ps, es, &q, &eq)) == 0)
       break;
     if(tok != 'a') {
